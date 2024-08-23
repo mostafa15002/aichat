@@ -209,22 +209,18 @@ app.listen(port, () => {
 });
  */
 
-import express from "express";
-import { Telegraf } from "telegraf";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import sharp from "sharp";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
+import { Telegraf } from 'telegraf';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import sharp from 'sharp';
+import fetch from 'node-fetch';
+import mysql from 'mysql2';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
-const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.API_KEY);
-const port = process.env.PORT || 3000;
 
-// MySQL connection using environment variables
-import mysql from "mysql2";
 const connection = mysql.createConnection({
   host: process.env.MYSQL_HOST,
   user: process.env.MYSQL_USER,
@@ -233,42 +229,37 @@ const connection = mysql.createConnection({
 });
 
 connection.connect((err) => {
-  if (err) throw err;
-  console.log("Connected to MySQL database.");
+  if (err) console.error('Error connecting to MySQL database:', err);
+  else console.log('Connected to MySQL database.');
 });
 
-// Fetch and process image
 async function fetchAndProcessImage(imageUrl) {
   try {
     const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.statusText}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
     const imageBuffer = await response.buffer();
     const resizedImage = await sharp(imageBuffer).resize(800).toBuffer();
     return resizedImage;
   } catch (error) {
-    console.error("Error processing image:", error);
+    console.error('Error processing image:', error);
     throw error;
   }
 }
 
-// Convert image to generative part
 async function imageToGenerativePart(imageBuffer) {
   return {
     inlineData: {
-      data: imageBuffer.toString("base64"),
-      mimeType: "image/jpeg",
+      data: imageBuffer.toString('base64'),
+      mimeType: 'image/jpeg',
     },
   };
 }
 
-// Generate content using Google AI
 async function rungemini(prompt, model, imageUrl = null) {
   try {
     const genAImodel = genAI.getGenerativeModel({ model: model });
 
-    if (model === "gemini-1.5-flash") {
+    if (model === 'gemini-1.5-flash') {
       if (imageUrl) {
         const imageBuffer = await fetchAndProcessImage(imageUrl);
         const part = await imageToGenerativePart(imageBuffer);
@@ -282,16 +273,14 @@ async function rungemini(prompt, model, imageUrl = null) {
       throw new Error(`Unsupported model: ${model}`);
     }
   } catch (error) {
-    console.error("Error generating content:", error);
+    console.error('Error generating content:', error);
     throw error;
   }
 }
 
-// Store user data in MySQL
 async function storeUserData(userId, username, message) {
   return new Promise((resolve, reject) => {
-    const query =
-      "INSERT INTO user_data (user_id, username, message) VALUES (?, ?, ?)";
+    const query = 'INSERT INTO user_data (user_id, username, message) VALUES (?, ?, ?)';
     connection.query(query, [userId, username, message], (err, results) => {
       if (err) return reject(err);
       resolve(results);
@@ -299,65 +288,47 @@ async function storeUserData(userId, username, message) {
   });
 }
 
-// Handle start command
-bot.start((ctx) => ctx.reply("Welcome!"));
+export default async function handler(req, res) {
+  if (req.method === 'POST') {
+    const update = req.body;
+    const chatId = update.message.chat.id;
 
-// Handle text messages
-bot.on("text", async (ctx) => {
-  try {
-    const message = ctx.message.text;
-    const userId = ctx.from.id;
-    const username = ctx.from.username || "Unknown";
+    if (update.message.text) {
+      const message = update.message.text;
+      const userId = update.message.from.id;
+      const username = update.message.from.username || 'Unknown';
 
-    await ctx.replyWithChatAction("typing");
-    const response = await rungemini(message, "gemini-1.5-flash");
+      try {
+        await bot.telegram.sendChatAction(chatId, 'typing');
+        const response = await rungemini(message, 'gemini-1.5-flash');
+        await storeUserData(userId, username, message);
+        await bot.telegram.sendMessage(chatId, response);
+        res.status(200).end();
+      } catch (error) {
+        console.error('Error handling text message:', error);
+        await bot.telegram.sendMessage(chatId, 'Sorry, there was an error processing your request.');
+        res.status(500).end();
+      }
+    } else if (update.message.photo) {
+      const photoId = update.message.photo[update.message.photo.length - 1].file_id;
+      const prompt = update.message.caption || '';
+      const fileLink = await bot.telegram.getFileLink(photoId);
 
-    // Store user data
-    await storeUserData(userId, username, message);
-
-    await ctx.reply(response);
-  } catch (error) {
-    console.error("Error handling text message:", error);
-    await ctx.reply("Sorry, there was an error processing your request.");
+      try {
+        await bot.telegram.sendChatAction(chatId, 'typing');
+        const response = await rungemini(prompt, 'gemini-1.5-flash', fileLink.href);
+        await storeUserData(chatId, update.message.from.username || 'Unknown', `Photo: ${fileLink.href}`);
+        await bot.telegram.sendMessage(chatId, response);
+        res.status(200).end();
+      } catch (error) {
+        console.error('Error handling photo message:', error);
+        await bot.telegram.sendMessage(chatId, 'Sorry, there was an error processing your photo.');
+        res.status(500).end();
+      }
+    } else {
+      res.status(400).end();
+    }
+  } else {
+    res.status(405).end();
   }
-});
-
-// Handle photo messages
-bot.on("photo", async (ctx) => {
-  try {
-    const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-    const prompt = ctx.message.caption || "";
-    const fileLink = await ctx.telegram.getFileLink(photoId);
-
-    await ctx.replyWithChatAction("typing");
-    const response = await rungemini(prompt, "gemini-1.5-flash", fileLink.href);
-
-    // Store user data
-    const userId = ctx.from.id;
-    const username = ctx.from.username || "Unknown";
-    await storeUserData(userId, username, `Photo: ${fileLink.href}`);
-
-    await ctx.reply(response);
-  } catch (error) {
-    console.error("Error handling photo message:", error);
-    await ctx.reply("Sorry, there was an error processing your photo.");
-  }
-});
-
-// Handle errors
-bot.catch((err, ctx) => {
-  console.error("Bot error:", err);
-  ctx.reply("An unexpected error occurred.");
-});
-
-// Start the bot
-bot.launch();
-
-// Express endpoint
-app.get("/", (req, res) => {
-  res.send("Hello World!");
-});
-
-app.listen(port, () => {
-  console.log(`App listening on port ${port}`);
-});
+}
